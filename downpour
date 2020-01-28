@@ -1,0 +1,372 @@
+import pandas as pd
+import argparse
+import sys
+import numpy as np
+import torch
+from torch.utils import data
+from torch import nn
+from torch import optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import datasets, transforms, models
+# from sklearn.preprocessing import MultiLabelBinarizer
+from torch.autograd import Variable
+# from skimage import io, transform
+import os
+from PIL import Image
+import time
+import random
+import torch.distributed as dist
+from math import ceil
+from random import Random
+from enum import Enum
+
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--use_cuda', action='store_true',help='use cuda flag' )
+parser.add_argument('--data_path','-d', default="/scratch/gd66/spring2019/lab2/kaggleamazon/", type=str)
+parser.add_argument('--optimizer','-o',default="adam", type=str)
+parser.add_argument('--nstep', '-n', default=2, type=int) 
+args = parser.parse_args()
+
+dist.init_process_group(backend="mpi")
+curr_rank = dist.get_rank()
+world_size = dist.get_world_size()
+server_rank = 0
+worker_list = list(range(1, world_size))
+worker_group = dist.new_group(ranks=worker_list)
+nsteps = args.nstep
+
+params = {'batch_size': 250,
+			  'shuffle': True,
+			  'num_workers': world_size-1,
+			  'backend':'mpi'}
+
+class MessageCode(Enum):
+    ParameterRequest = 0
+    GradientUpdate = 1
+    CloseServer = 2
+
+class Partition(object):
+	def __init__(self, data, index):
+		self.data = data
+		self.index = index
+
+	def __len__(self):
+		return len(self.index)
+    
+	def __getitem__(self, index):
+		data_idx = self.index[index]
+		return self.data[data_idx]
+
+class Amazon_Dataset(data.Dataset):
+	def __init__(self, dataset, img_dir, transform=None):
+		self.dataset = dataset
+		self.img_dir = img_dir
+		self.transform = transform
+
+		self.X_train = dataset['image_name']
+		self.y_train = dataset['tags']
+		self.num_labels = 17
+
+	def __getitem__(self, index):
+
+		img_name = os.path.join(self.img_dir,self.X_train[index] + '.jpg')
+		image = Image.open(img_name)
+		image = image.convert('RGB')
+
+
+		if self.transform is not None:
+			image = self.transform(image)
+
+		label_ids = self.y_train[index].split()
+		label_ids = [ int(s) for s in label_ids ]
+		label=torch.zeros(self.num_labels)
+		label[label_ids] = 1
+		return image, label
+
+	def __len__(self):
+		return len(self.X_train.index)
+
+class DataPartitioner(object):
+	def __init__(self, data, sizes=[0.7, 0.2, 0.1], seed=1234):
+		self.data = data
+		self.partitions = []
+		rng = random.Random()
+		rng.seed(seed)
+		data_len = len(data)
+		indexes = [x for x in range(0, data_len)]
+		rng.shuffle(indexes)
+
+		for frac in sizes:
+			part_len = int(frac * data_len)
+			self.partitions.append(indexes[0:part_len])
+			indexes = indexes[part_len:]
+	
+	def get(self, partition):
+		return Partition(self.data, self.partitions[partition])
+
+def get_partition_dataloader(dataset, batch_size, num_workers, curr_rank):
+	partition_ratio = [1.0/num_workers for _ in range(num_workers)]
+	partitioner = DataPartitioner(dataset, partition_ratio)
+	curr_rank_dataset = partitioner.get(curr_rank-1) 
+	train_set = torch.utils.data.DataLoader(curr_rank_dataset, batch_size=batch_size, shuffle=True)
+	return train_set
+
+class AverageMeter(object):
+	def __init__(self):
+		self.reset()
+
+	def reset(self):
+		self.val = 0
+		self.avg = 0
+		self.sum = 0
+		self.count = 0
+
+	def update(self, val, n=1):
+		self.val = val
+		self.sum += val * n
+		self.count += n
+		self.avg = self.sum / self.count
+
+class Inception(nn.Module):
+	def __init__(self,in_channels,out_channels):
+		super(Inception,self).__init__()
+		
+
+		self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0,stride=1)
+		self.conv3 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1,stride=1)
+		self.conv5 = nn.Conv2d(in_channels, out_channels, kernel_size=5, padding=2,stride=1)
+
+	def forward(self,input):
+		output1 = self.conv1(input)
+		output3 = self.conv3(input)
+		output5 = self.conv5(input)
+
+		return torch.cat((output1,output3,output5),dim=1)
+
+class CNN(nn.Module):
+	def __init__(self):
+		super(CNN, self).__init__()
+
+		self.inception1 = Inception(3,10)
+
+		self.inception2 = Inception(30,10)
+
+		self.MaxPool = nn.MaxPool2d(2)
+
+		self.relu = nn.ReLU()
+
+		self.fc1 = nn.Linear(8*8*30, 256)
+
+		self.fc2 = nn.Linear(256,17)
+
+		self.sig = nn.Sigmoid()
+
+
+
+		
+	def forward(self, x):
+
+		out = self.inception1(x)
+		out = self.MaxPool(out)
+		out = self.relu(out)
+
+		out = self.inception2(out)
+		out = self.MaxPool(out)
+		out = self.relu(out)
+
+		out = out.view(out.size(0), -1)
+		out = self.fc1(out)
+		out = self.relu(out)
+		out = F.dropout(out, training=self.training)
+		out = self.fc2(out)
+		out = self.sig(out)
+
+		return out
+
+def main():
+	num_epochs = 5
+	dataset = pd.read_csv(args.data_path+"train.csv",encoding="utf-8")
+	labels = pd.read_csv(args.data_path+"labels.csv",encoding="utf-8")
+
+	data_transforms = {
+				'train': transforms.Compose([
+					transforms.Resize(32),
+					transforms.ToTensor()
+				])
+			}
+	transformed_dataset = Amazon_Dataset(dataset=dataset,
+												   img_dir=os.path.join(args.data_path,'train-jpg'),
+												   transform=data_transforms['train']
+												   )
+
+	use_cuda = torch.cuda.is_available() and args.use_cuda
+	device = torch.device("cuda:0" if use_cuda else "cpu")
+
+	model = CNN().to(device)
+	learning_rate = 0.01
+	momentum = 0.9
+	if args.optimizer == 'adam':
+		optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+	elif args.optimizer == 'nesterov':
+		optimizer = torch.optim.SGD(model.parameters(),momentum = momentum, lr=learning_rate,nesterov = True)
+	elif args.optimizer == 'adagrad':
+		optimizer = torch.optim.Adagrad(model.parameters(), lr=learning_rate)
+	elif args.optimizer == 'adadelta':
+		optimizer = torch.optim.Adadelta(model.parameters(), lr=learning_rate)
+	else:	
+		optimizer = torch.optim.SGD(model.parameters(),momentum = momentum, lr=learning_rate)
+
+	param_size = 0
+	for name,param in model.named_parameters():
+		param_size+=param.numel()
+
+	###Worker Code
+	if curr_rank in worker_list:
+		bsz = params['batch_size']
+		dataloader = get_partition_dataloader(transformed_dataset, bsz, params['num_workers'], curr_rank)
+		num_batches = ceil(len(dataloader.dataset) / float(bsz))
+
+		optimizer.zero_grad()
+		critereon = nn.BCELoss()
+
+		start_time = time.monotonic()
+		
+		payload = torch.zeros(param_size)
+		dist.broadcast(payload,src=0)
+		for name, param in model.named_parameters():
+			param.data = payload[:param.numel()].view(param.shape)
+			payload = payload[param.numel():]
+
+		losses = AverageMeter()
+		precisions_1 = AverageMeter()
+		precisions_k = AverageMeter()
+		num_samples = AverageMeter()
+		total_time = AverageMeter()
+
+		for epoch in range(num_epochs):
+			losses.reset()
+			precisions_1.reset()
+			precisions_k.reset()
+			num_samples.reset()
+			epoch_start_time = time.monotonic()
+			accum_gradients = torch.zeros(param_size)
+
+			step = 1
+			for idx,(data, target) in enumerate(dataloader):
+				output = model(data)
+				loss = critereon(output, target)
+				loss.backward()
+				gradients = torch.Tensor()
+				for param in model.parameters():
+					gradients = torch.cat((gradients,param.grad.data.view(-1)))
+
+				accum_gradients.add_(gradients)
+
+				if step%nsteps==0:
+					dist.send(torch.Tensor([MessageCode.GradientUpdate.value]),0)
+					dist.send(accum_gradients,dst=0)
+					accum_gradients.zero_()
+
+					payload = torch.zeros(param_size)
+					dist.recv(payload,src=0)
+					for param in model.parameters():
+						param.data = payload[:param.numel()].view(param.shape)
+						payload = payload[param.numel():]
+				else:
+					optimizer.step()
+
+				step += 1
+				topk=3
+				_, predicted = output.topk(topk, 1, True, True)
+				batch_size = target.size(0)
+				prec_k=0
+				prec_1=0
+				count_k=0
+				for j in range(batch_size):
+					prec_k += target[j][predicted[j]].sum()
+					prec_1 += target[j][predicted[j][0]]
+					count_k+=topk #min(target[i].sum(), topk)
+				prec_k/=count_k
+				prec_1/=batch_size
+
+				num_samples.update(batch_size,1)
+				losses.update(loss.item(), 1)
+				precisions_1.update(prec_1, 1)
+				precisions_k.update(prec_k, 1)
+
+
+			epoch_end_time = time.monotonic()
+			epoch_time = epoch_end_time - epoch_start_time
+			total_time.update(epoch_end_time-start_time)
+
+			dist.barrier(group=worker_group)
+			if curr_rank==1:
+				dist.send(torch.Tensor([MessageCode.ParameterRequest.value]),0)
+
+			payload = torch.zeros(param_size)
+			dist.broadcast(payload,src=0)
+
+			for param in model.parameters():
+				param.data = payload[:param.numel()].view(param.shape)
+				payload = payload[param.numel():]
+            
+			num_samples_T = torch.Tensor([num_samples.sum])
+			losses_T = torch.Tensor([losses.avg*num_samples.sum])
+			precisions_1T = torch.Tensor([precisions_1.avg*num_samples.sum])
+			precisions_kT = torch.Tensor([precisions_k.avg*num_samples.sum])
+
+			dist.all_reduce(losses_T,op=dist.ReduceOp.SUM,group=worker_group)
+			dist.all_reduce(precisions_1T,op=dist.ReduceOp.SUM,group=worker_group)
+			dist.all_reduce(precisions_kT,op=dist.ReduceOp.SUM,group=worker_group)
+			dist.all_reduce(num_samples_T,op=dist.ReduceOp.SUM,group=worker_group)
+
+			print("Rank: {} Epoch: {} Loss: {:.3f} Prec@1: {:.3f} Prec@3: {:.3f} Execution Time: {:.3f}".format(curr_rank,epoch+1,losses_T.item()/num_samples_T.item(),precisions_1T.item()/num_samples_T.item(),precisions_kT.item()/num_samples_T.item(),epoch_time))
+			start_time = time.monotonic()
+
+		dist.send(torch.Tensor([MessageCode.CloseServer.value]),0)
+		dist.barrier(group=worker_group)
+
+		print("Rank: {} Last Epoch Loss: {:.3f} Last Epoch Prec@1: {:.3f} Last Epoch Prec@3: {:.3f} Total Exec Time: {:.3f}".format(curr_rank,losses_T.item()/num_samples_T.item(),precisions_1T.item()/num_samples_T.item(),precisions_kT.item()/num_samples_T.item(),total_time.sum))
+	
+	####SERVER CODE	
+	else:
+		optimizer.zero_grad()
+		payload = torch.Tensor()
+		for param in model.parameters():
+			payload = torch.cat((payload,param.data.view(-1)))
+
+		dist.broadcast(payload,src=0)
+		running = True
+		while running:
+			message=torch.zeros(1)
+			src = dist.recv(message)
+
+			if message.item()==MessageCode.ParameterRequest.value:
+				payload = torch.Tensor()
+				for name,param in model.named_parameters():
+					payload = torch.cat((payload,param.data.view(-1)))
+				dist.broadcast(payload,0)
+
+			elif message.item()==MessageCode.GradientUpdate.value:   
+				payload = torch.zeros(param_size)
+				dist.recv(payload,src)
+
+				for param in model.parameters():
+					param.grad = payload[:param.numel()].view(param.shape)
+					payload = payload[param.numel():]
+
+				optimizer.step()
+
+				payload = torch.Tensor()
+				for param in model.parameters():
+					payload = torch.cat((payload,param.data.view(-1)))
+				dist.send(payload,src)
+
+			elif message.item()==MessageCode.CloseServer.value:
+				running = False
+
+if __name__ == "__main__":
+	main()
